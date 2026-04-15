@@ -1,0 +1,187 @@
+---
+title: "Statistical Methods for Machine Learning - Tugas Pra UTS bag. A/B Testing Random Forest"
+subtitle: "Klasifikasi Deposito Berjangka Bank"
+author: "Sala Jalaludin"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r}
+library(tidyverse)
+library(caret)
+library(doParallel)
+library(ranger)
+```
+
+# PERSIAPAN DATA DASAR
+```{r}
+df <- read.csv("dataset_A.csv", stringsAsFactors = TRUE)
+
+df_clean <- df %>%
+  distinct() %>% 
+  mutate(across(where(is.factor), ~na_if(as.character(.), "unknown"))) %>%
+  drop_na() %>% 
+  mutate(education = ifelse(grepl("basic", education), "basic", education)) %>%
+  mutate(
+    previous_contact = ifelse(pdays != 999, 1, 0),
+    previous_contact = as.factor(previous_contact)
+  ) %>%
+  select(-pdays, -duration) %>%
+  mutate(y = as.factor(y)) %>%
+  mutate(year = case_when(
+    emp.var.rate > 0 ~ 2008,
+    emp.var.rate <= 0 & emp.var.rate > -2 ~ 2009,
+    emp.var.rate <= -2 ~ 2010
+  )) %>%
+  mutate(year = as.factor(year)) %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+# DUMMY ENCODING & HAPUS NZV
+```{r}
+dummies <- dummyVars(~ ., data = df_clean %>% select(-y))
+df_base <- as.data.frame(predict(dummies, newdata = df_clean))
+df_base$y <- df_clean$y
+
+nzv_cols <- nearZeroVar(df_base)
+if(length(nzv_cols) > 0) {
+  df_base <- df_base[, -nzv_cols]
+}
+```
+
+# MEMBUAT DUA VERSI DATASET
+```{r}
+# Versi 1: Multikolinearitas tak Dihapus
+data_keep_all <- df_base
+
+# DATA DIHAPUS KORELASINYA (Multikolinearitas Dihapus > 0.90)
+corr_matrix <- cor(df_base %>% select(where(is.numeric)))
+highlyCorDescr <- findCorrelation(corr_matrix, cutoff = 0.90)
+data_dropped <- df_base[, -highlyCorDescr]
+
+cat("\nJumlah Fitur (Tidak Dihapus):", ncol(data_keep_all) - 1)
+cat("\nJumlah Fitur (Dihapus):", ncol(data_dropped) - 1, "\n")
+```
+
+# SPLIT DATA
+```{r}
+set.seed(16)
+train_idx <- createDataPartition(df_base$y, p = 0.8, list = FALSE)
+
+train_keep <- data_keep_all[train_idx, ]
+valid_keep <- data_keep_all[-train_idx, ]
+
+train_drop <- data_dropped[train_idx, ]
+valid_drop <- data_dropped[-train_idx, ]
+```
+
+# TRAINING KEDUA MODEL
+```{r}
+# Parallel Processing untuk mempercepat
+cl <- makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+
+train_control <- trainControl(method = 'cv', number = 3, classProbs = TRUE, 
+                              summaryFunction = twoClassSummary, sampling = "down")
+
+cat("\n--- Melatih Model 1: Multikolinearitas TIDAK Dihapus ---\n")
+set.seed(16)
+time_keep <- system.time({
+  rf_keep <- train(y ~ ., data = train_keep, method = 'ranger', 
+                   metric = 'ROC', trControl = train_control, 
+                   importance = 'impurity', num.threads = 1)
+})
+
+cat("--- Melatih Model 2: Multikolinearitas DIHAPUS ---\n")
+set.seed(16)
+time_drop <- system.time({
+  rf_drop <- train(y ~ ., data = train_drop, method = 'ranger', 
+                   metric = 'ROC', trControl = train_control, 
+                   importance = 'impurity', num.threads = 1)
+})
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+# EVALUASI DAN PERBANDINGAN
+```{r}
+# Membuat fungsi Evaluasi
+evaluate_model_tuned <- function(model, valid_data, model_name) {
+  # Ekstrak probabilitas tebakan "yes"
+  probs <- predict(model, newdata = valid_data, type = "prob")[, "yes"]
+  actual_yes <- valid_data$y == "yes"
+  best_f1 <- 0
+  best_th <- 0.5
+  best_metrics <- data.frame()
+  # Looping threshold optimal dari 0.30 s/d 0.85
+  for(th in seq(0.30, 0.85, by = 0.02)) {
+    pred_yes <- probs >= th
+    tp <- sum(pred_yes & actual_yes, na.rm = TRUE)
+    fp <- sum(pred_yes & !actual_yes, na.rm = TRUE)
+    fn <- sum(!pred_yes & actual_yes, na.rm = TRUE)
+    tn <- sum(!pred_yes & !actual_yes, na.rm = TRUE)
+    prec <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+    rec <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+    f1_val <- ifelse((prec + rec) == 0, 0, 2 * (prec * rec) / (prec + rec))
+    # Simpan jika F1-Score ini adalah yang tertinggi sementara
+    if(!is.na(f1_val) && f1_val > best_f1) {
+      best_f1 <- f1_val
+      best_th <- th
+      acc <- (tp + tn) / length(actual_yes)
+      best_metrics <- data.frame(
+        Skenario = model_name,
+        Optimal_Threshold = best_th,
+        Accuracy = round(acc, 4),
+        Sensitivity = round(rec, 4),
+        Precision = round(prec, 4),
+        F1_Score = round(f1_val, 8)
+      )
+    }
+  }
+  return(best_metrics)
+}
+
+# Evaluasi kedua model
+res_keep <- evaluate_model_tuned(rf_keep, valid_keep, "1. TIDAK Dihapus (Semua Fitur)")
+res_drop <- evaluate_model_tuned(rf_drop, valid_drop, "2. DIHAPUS (Bebas Korelasi > 0.9)")
+
+perbandingan <- bind_rows(res_keep, res_drop)
+
+# Menampilkan Hasil
+print(perbandingan)
+cat("\n--- Waktu Komputasi (Detik) ---\n")
+cat("Tidak Dihapus :", round(time_keep["elapsed"], 2), "detik\n")
+cat("Dihapus       :", round(time_drop["elapsed"], 2), "detik\n")
+```
+
+```{r}
+# Pastikan objek diffs sudah dibuat
+diffs_obj <- diff(resamples_data)
+
+# Ambil summary-nya
+summary_output <- summary(diffs_obj)
+
+cat("\n=== HASIL UJI STATISTIK (P-VALUE) ===\n")
+
+# Cara 1: Cetak seluruh tabel p-value (biasanya di sini letaknya)
+if(!is.null(summary_output$table)) {
+  print(summary_output$table)
+} else {
+  # Cara 2: Jika struktur berbeda, paksa cetak isi statistics
+  print(summary_output)
+}
+
+# Cara 3: Langsung ambil nilai spesifik P-Value untuk ROC
+# (Biasanya tersimpan dalam matriks p.value)
+cat("\nMatriks P-Value Spesifik:\n")
+print(summary_output$p.value$ROC)
+```

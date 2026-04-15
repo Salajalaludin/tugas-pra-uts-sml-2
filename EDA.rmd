@@ -1,0 +1,340 @@
+---
+title: "Statistical Methods for Machine Learning - Tugas Pra UTS bag. EDA"
+subtitle: "Klasifikasi Deposito Berjangka Bank"
+author: "Sala Jalaludin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: cosmo
+    highlight: tango
+---
+
+# SETUP LIBRARY & LOAD DATA
+
+Tahap awal analisis dilakukan dengan memuat library utama dalam ekosistem R. Penggunaan library ini bertujuan untuk memastikan proses manipulasi data dan visualisasi berjalan efisien:
+
+```{r}
+# install.packages(c("tidyverse", "corrplot", "gridExtra")) # jika belum ada
+library(tidyverse) # Manipulasi data dan visualisasi
+library(corrplot) # Visualisasi matriks korelasi
+library(gridExtra) # Menampilkan beberapa plot dalam satu halaman
+
+df <- read.csv("dataset_A.csv", stringsAsFactors = FALSE)
+```
+
+- `tidyverse`: Digunakan sebagai framework utama untuk manipulasi data (`dplyr`) dan visualisasi statis (`ggplot2`).
+
+- `corrplot`: Digunakan khusus untuk memvisualisasikan matriks korelasi antar fitur numerik guna mendeteksi multikolinearitas.
+
+- `gridExtra`: Digunakan untuk mengatur tata letak (layout) beberapa grafik agar dapat ditampilkan berdampingan dalam satu bingkai laporan.
+
+# DATA PREPARATION
+```{r}
+# Menurunkan variabel Tahun berdasarkan rasio emp.var.rate (seperti Jupyter Nb)
+df <- df %>%
+  mutate(year = case_when(
+    emp.var.rate > 0 ~ "2008",
+    emp.var.rate <= 0 & emp.var.rate > -2 ~ "2009",
+    emp.var.rate <= -2 ~ "2010",
+    TRUE ~ "Unknown"
+  )) %>%
+  mutate(year = factor(year))
+
+# Mengurutkan bulan kronologis
+month_levels <- c("mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+df$month <- factor(df$month, levels = month_levels)
+```
+
+Data mentah melalui beberapa tahap transformasi agar siap dianalisis:
+
+1. Penggabungan/Pemilihan Data
+   
+   Menggunakan dataset_A.csv sebagai basis utama karena memiliki label target y.
+
+2. Konstruksi Fitur Temporal (Year)
+   
+   Karena dataset tidak memiliki kolom tahun, kita melakukan ekstraksi fitur berdasarkan variabel emp.var.rate. Logikanya adalah mengikuti siklus ekonomi: nilai positif mencerminkan kondisi ekonomi awal (2008), dan nilai yang menurun drastis mencerminkan dampak krisis keuangan (2009-2010).
+
+3. Ordering Categorical
+   
+   Mengatur ulang level pada kolom month agar urutannya kronologis (Mar-Des), bukan berdasarkan abjad.
+
+# BASIC DATA INFORMATION
+```{r}
+cat("=== Dimensi Dataset ===\n")
+print(dim(df))
+
+cat("\n=== Missing/Unknown Values ===\n")
+print(colSums(is.na(df) | df == "unknown"))
+```
+
+Dataset ini merepresentasikan 41.188 kontak pelanggan (seperti yang terlihat pada total frekuensi target).
+
+- Atribut
+  
+  Terdiri dari data demografi (umur, pekerjaan), data sosial ekonomi (euribor, indeks harga konsumen), dan data kampanye (durasi, jumlah kontak).
+
+- Nilai Unknown
+  
+  Ditemukan sejumlah nilai "unknown" pada kolom kategori. Ini menunjukkan adanya data yang tidak lengkap pada profil nasabah yang perlu diperhatikan saat pemodelan.
+
+# TARGET DISTRIBUTION & CORRELATION MATRIX
+```{r}
+# A. Bar chart Target 'y'
+p_target <- ggplot(df, aes(x = y, fill = y)) +
+  geom_bar(color = "black", alpha = 0.8) +
+  geom_text(stat = 'count', aes(label = ..count..), vjust = -0.5) +
+  labs(title = "Distribution of the Target (y)", x = "Term Deposit", y = "Count") +
+  theme_minimal()
+print(p_target)
+
+# B. Correlation Matrix Numeric Features
+numeric_cols <- df %>% select_if(is.numeric)
+cor_matrix <- cor(numeric_cols, use = "complete.obs")
+
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         number.cex = 0.7, title = "Correlation Matrix", mar = c(0,0,1,0))
+```
+
+1. Berdasarkan plot pertama pada laporan (Image 1):
+
+    - Ketidakseimbangan Kelas (Class Imbalance)
+    
+     Terlihat perbedaan mencolok antara nasabah yang menolak (no sekitar 32.545) dan yang menerima (yes sekitar 4.526).
+
+    - Insight
+    
+      Hanya sekitar 11% nasabah yang sukses dikonversi. Hal ini menandakan bahwa model klasifikasi nantinya akan menghadapi tantangan imbalance data, sehingga metrik seperti F1-Score atau AUC-ROC akan lebih relevan dibandingkan sekadar Akurasi.
+
+2. Berdasarkan heatmap korelasi (Image 2):
+
+   - Multikolinearitas Makro
+     
+     Terdapat korelasi yang sangat kuat (mendekati 1.0) antara euribor3m, emp.var.rate, dan nr.employed. Ini menunjukkan bahwa variabel-variabel ekonomi makro ini saling terkait erat.
+
+   - Korelasi Target
+     
+     Variabel pdays dan previous menunjukkan hubungan dengan keberhasilan kampanye sebelumnya, mengindikasikan bahwa nasabah yang pernah dihubungi sebelumnya memiliki kecenderungan perilaku yang berbeda.
+
+# FEATURE ANALYSIS: MONTH & YEAR DYNAMICS
+```{r}
+# A. Month category by year
+p_month_year <- ggplot(df %>% filter(!is.na(month)), aes(x = month, fill = year)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Month Category grouped by Year", x = "Month", y = "Count") +
+  theme_minimal()
+print(p_month_year)
+
+# B. YES Proportion by Month category and year
+df_yes_prop <- df %>%
+  filter(!is.na(month)) %>%
+  group_by(year, month) %>%
+  summarise(
+    total = n(),
+    yes_count = sum(y == "yes"),
+    yes_proportion = yes_count / total,
+    .groups = 'drop'
+  )
+
+p_yes_prop <- ggplot(df_yes_prop, aes(x = month, y = yes_proportion, fill = year)) +
+  geom_col(position = "dodge", color="black", alpha=0.8) +
+  labs(title = "YES Proportion by Month category and Year", x = "Month", y = "Success Proportion") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+print(p_yes_prop)
+```
+
+Berdasarkan plot distribusi bulan per tahun (Image 3):
+
+- Volume vs Efektivitas
+  
+  Bulan Mei (may) memiliki volume panggilan tertinggi, terutama di tahun 2008. Namun, jika dibandingkan dengan plot proporsi "YES", bulan dengan volume rendah seperti Maret (mar) dan Desember (dec) justru memiliki tingkat keberhasilan konversi yang jauh lebih tinggi.
+
+- Strategi Bank
+  
+  Terlihat pergeseran strategi dari tahun 2008 (panggilan masif namun kurang tertarget) menuju tahun 2010 (panggilan lebih sedikit namun lebih efektif).
+
+# ANALYSIS FOR ALL YEARS (2008, 2009, 2010)
+```{r}
+# A. Median values of all numeric columns GROUPED BY YEAR
+cat("\n=== Median Values of Numeric Columns Grouped by Year ===\n")
+median_by_year <- df %>%
+  group_by(year) %>%
+  summarise(across(where(is.numeric), median, na.rm = TRUE))
+print(as.data.frame(median_by_year))
+
+# B. Distributions of Categorical Columns Faceted for ALL YEARS (Job)
+p_job_year <- ggplot(df, aes(x = job, fill = job)) +
+  geom_bar() +
+  coord_flip() + 
+  facet_wrap(~year, scales = "free_x") + # Membagi grafik menjadi 3 panel (2008, 2009, 2010)
+  labs(title = "Job Distribution Faceted by Year (2008 - 2010)", x = "Job Category", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+print(p_job_year)
+
+# C. Distributions of Categorical Columns Faceted for ALL YEARS (Education)
+p_edu_year <- ggplot(df, aes(x = education, fill = education)) +
+  geom_bar() +
+  coord_flip() + 
+  facet_wrap(~year, scales = "free_x") + 
+  labs(title = "Education Distribution Faceted by Year (2008 - 2010)") +
+  theme_minimal() + theme(legend.position = "none")
+print(p_edu_year)
+
+# D. Correlation With Year
+df_for_cor <- df %>%
+  mutate(year_numeric = as.numeric(as.character(year))) %>%
+  select_if(is.numeric)
+
+cor_year <- cor(df_for_cor, use = "complete.obs")[, "year_numeric"]
+cat("\n=== Correlation of Numeric Features with Year ===\n")
+print(sort(cor_year, decreasing = TRUE))
+```
+
+
+1. Dinamika Ekonomi Makro (2008-2010)
+   
+   Tabel median menunjukkan perubahan drastis pada variabel ekonomi. Suku bunga Euribor 3 bulan (euribor3m) merosot tajam dari median 4.961 pada tahun 2008 menjadi hanya 1.268 pada tahun 2010. Hal ini sejalan dengan hasil korelasi numerik di mana euribor3m memiliki korelasi negatif yang sangat kuat (-0.978) terhadap variabel tahun. Ini membuktikan bahwa kampanye dilakukan dalam periode krisis ekonomi global di mana bank sentral menurunkan suku bunga secara agresif.
+
+2. Stabilitas Profil Nasabah
+   
+   Meskipun kondisi ekonomi berubah total, profil demografi nasabah yang dihubungi (median age) relatif stabil di angka 36-39 tahun. Ini menunjukkan bahwa meskipun bank mengubah strategi pemilihan waktu dan kondisi ekonomi, target pasar inti mereka tetap pada kelompok usia produktif.
+
+3. Korelasi Fitur Numerik dengan Tahun
+   
+   - Korelasi Negatif Kuat
+     
+     emp.var.rate (-0.971) dan euribor3m (-0.978) menunjukkan tren penurunan ekonomi yang absolut seiring berjalannya waktu kampanye.
+   
+   - Korelasi Positif
+     previous (0.424) menunjukkan bahwa seiring bertambahnya tahun (ke 2010), bank lebih banyak menghubungi nasabah yang sudah pernah dihubungi sebelumnya (pengulangan kontak), yang kemungkinan besar berkaitan dengan strategi peningkatan efisiensi konversi.
+
+3. Berdasarkan plot distribusi pekerjaan
+   
+   - Segmen Utama
+     
+     Pekerjaan admin., blue-collar, dan technician mendominasi basis data kontak di setiap tahun.
+
+   - Perubahan Target
+     
+     Pada tahun 2010, terlihat bank mulai memberikan porsi lebih kepada kelompok retired (pensiunan) dan student (pelajar). Berdasarkan analisis lanjutan, kedua kelompok ini cenderung memiliki respons positif yang lebih tinggi terhadap produk deposito berjangka dibandingkan kelompok pekerja kerasul.
+
+```{r}
+# Membandingkan distribusi numerik terhadap output variabel target (y)
+p_age <- ggplot(df, aes(x = age, fill = y)) +
+  geom_density(alpha = 0.5) + 
+  labs(title = "Age Density by Target Variable (y)") +
+  theme_minimal()
+
+p_duration <- ggplot(df, aes(x = y, y = duration, fill = y)) +
+  geom_boxplot() + 
+  labs(title = "Call Duration Boxplot by Target Variable (y)") +
+  theme_minimal()
+
+# Tampilkan bersebelahan menggunakan gridExtra
+grid.arrange(p_age, p_duration, ncol=2)
+```
+
+Berdasarkan visualisasi perbandingan fitur numerik terhadap variabel target y, diperoleh temuan sebagai berikut:
+
+1. Distribusi Usia (Age Density Plot):
+
+   - Insight
+     
+     Kurva densitas untuk nasabah yang menjawab "yes" dan "no" hampir berhimpit pada rentang usia produktif (30-50 tahun). Namun, terdapat sedikit "benjolan" atau kenaikan densitas pada kelompok usia di bawah 25 tahun (pelajar) dan di atas 60 tahun (pensiunan) untuk kategori "yes".
+
+2. Durasi Panggilan (Call Duration Boxplot):
+
+   - Insight
+     
+     Perbedaan antara kedua boxplot sangat mencolok. Nasabah yang akhirnya berlangganan (yes) memiliki median durasi panggilan yang jauh lebih tinggi dibandingkan nasabah yang menolak (no). Banyak pencilan (outliers) pada kategori "yes" menunjukkan bahwa komunikasi yang mendalam dan panjang sering kali diperlukan untuk mencapai kesepakatan.
+
+   - Data Leakage
+     
+     Secara analitis, durasi adalah prediktor yang sangat kuat. Namun, fitur ini memiliki masalah Data Leakage. Dalam skenario dunia nyata, durasi panggilan tidak diketahui sebelum panggilan dilakukan. Oleh karena itu, fitur ini memberikan informasi "masa depan" ke dalam model.
+
+# KESIMPULAN & REKOMENDASI
+
+1. Kesimpulan Analisis
+   
+   Berdasarkan eksplorasi data yang telah dilakukan terhadap kampanye pemasaran bank periode 2008-2010, dapat ditarik beberapa kesimpulan utama:
+
+   - Efektivitas Strategi Kampanye
+     
+     Terdapat pergeseran strategi dari kuantitas (volume telepon tinggi pada Mei 2008) menuju kualitas. Meskipun volume panggilan menurun di tahun 2010, rasio keberhasilan (Success Proportion) justru meningkat secara signifikan pada bulan-bulan tertentu seperti Maret, September, dan Desember.
+
+   - Pengaruh Faktor Makroekonomi
+     
+     Kondisi ekonomi eksternal memainkan peran vital. Penurunan drastis suku bunga Euribor 3M (dari median 4.9% ke 1.2%) berkorelasi kuat dengan perubahan perilaku nasabah dalam mengambil produk deposito berjangka.
+
+   - Segmentasi Nasabah Potensial
+     
+     Kelompok pekerjaan student (pelajar) dan retired (pensiunan) menunjukkan respons positif yang lebih konsisten dibandingkan kelompok pekerja kerah biru (blue-collar), meskipun jumlah mereka dalam dataset jauh lebih sedikit.
+
+   - Anomali Fitur Duration
+    
+     Fitur duration memiliki daya pembeda yang paling ekstrem terhadap target y. Namun, secara praktis fitur ini bersifat post-facto (baru diketahui setelah panggilan berakhir), sehingga tidak dapat digunakan sebagai prediktor saat menentukan siapa yang harus dihubungi.
+
+2. Rekomendasi Teknis (Machine Learning)
+   
+   Untuk tahap pembangunan model prediksi di masa mendatang, direkomendasikan beberapa hal berikut:
+   
+   - Penyelesaian Data Imbalance
+    
+     Mengingat rasio "YES" hanya ~11%, model klasifikasi akan cenderung bias. Rekomendasi menggunakan teknik resampling seperti SMOTE (Synthetic Minority Over-sampling Technique) atau penyesuaian class weight pada algoritma.
+   
+   - Penanganan Data Leakage
+     
+     Wajib menghapus fitur duration sebelum proses training. Menggunakan durasi dalam model prediksi akan menyebabkan akurasi semu (overfitting) yang tidak berguna dalam implementasi nyata.
+   
+   - Feature Engineering
+     
+     Mengingat tingginya multikolinearitas pada variabel makroekonomi (Euribor, emp.var.rate, nr.employed), disarankan untuk menggunakan PCA (Principal Component Analysis) atau memilih satu fitur representatif guna meningkatkan stabilitas model.
+   
+   - Pemilihan Metrik
+     
+     Hindari menggunakan Accuracy. Gunakan F1-Score atau AUC-ROC untuk mengevaluasi kinerja model guna memastikan nasabah yang berpotensi "YES" dapat terdeteksi secara akurat (Recall).
+
+3. Strategi Bisnis Terapan
+   
+   - Optimalisasi Waktu Kampanye
+   
+     Memfokuskan anggaran pemasaran pada bulan-bulan dengan rasio keberhasilan tinggi (Maret, September, Oktober, Desember) daripada melakukan kampanye masif di bulan Mei.
+
+   - Targeting Berbasis Profil
+     Meningkatkan pendekatan personal kepada segmen pensiunan dan pelajar, serta mengevaluasi kembali skema penawaran untuk segmen pekerja kerah biru yang memiliki tingkat penolakan tinggi.
+
+
+
+# EXPORTING PLOTS TO PDF
+```{r, eval = FALSE}
+# Tentukan nama file dan dimensi (dalam inci)
+pdf("EDA_Plots_Bank_Deposit.pdf", width = 11, height = 8.5)
+
+# --- Masukkan semua baris p_target, corrplot, p_month_year, dsb di sini ---
+
+print(p_target)
+
+# Khusus corrplot tidak perlu print() karena bukan objek ggplot
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         number.cex = 0.7, title = "Correlation Matrix", mar = c(0,0,1,0))
+
+print(p_month_year)
+print(p_yes_prop)
+print(p_job_year)
+print(p_edu_year)
+
+# Gabungan gridExtra
+grid.arrange(p_age, p_duration, ncol=2)
+
+# Tutup device PDF
+dev.off()
+```

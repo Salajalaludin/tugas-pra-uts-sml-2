@@ -1,0 +1,578 @@
+---
+title: "Statistical Methods for Machine Learning - Tugas Pra UTS bag. TRAIN"
+subtitle: "Klasifikasi Deposito Berjangka Bank"
+author: "Sala Jalaludin"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: cosmo
+    highlight: tango
+---
+
+# load libraries and setup parallel processing
+```{r}
+library(tidyverse)
+library(caret)
+library(themis)
+library(doParallel)
+library(parallel)
+
+gc() # Clear RAM
+cores <- parallel::detectCores()
+cl <- makePSOCKcluster(cores - 1)
+registerDoParallel(cl)
+```
+
+# Load dataset A
+```{r}
+df <- read.csv("dataset_A.csv", stringsAsFactors = TRUE)
+```
+
+# Data Cleaning & Feature Engineering
+```{r}
+df_clean <- df %>%
+  # Hapus error pada cons.price.idx (yang mendekati 0)
+  filter(cons.price.idx > 1000) %>% 
+  # Filter campaign yang terlalu ekstrem (di atas Q3 + 1.5*IQR)
+  group_by(y) %>%
+  mutate(
+    up_campaign = quantile(campaign, 0.75) + 1.5 * IQR(campaign)
+  ) %>%
+  filter(campaign <= up_campaign) %>%
+  ungroup() %>%
+  select(-up_campaign) %>%
+  # Hapus baris duplikat (tak ada ID unik, jadi kita hapus duplikat berdasarkan semua kolom)
+  distinct() %>%
+  # Handle 'unknown' dalam text (Ubah jadi NA, lalu hapus barisnya)
+  mutate(across(where(is.factor), ~na_if(as.character(.), "unknown"))) %>%
+  drop_na() %>%
+  # Gabungkan kategori edukasi 'basic' agar fitur tidak terlalu pecah
+  mutate(education = ifelse(grepl("basic", education), "basic", education)) %>%
+  # Handle nilai 999 pada pdays menjadi indikator biner (1/0)
+  mutate(
+    previous_contact = ifelse(pdays != 999, 1, 0),
+    previous_contact = as.factor(previous_contact)
+  ) %>%
+  select(-pdays) %>%
+  # Convert target (y) menjadi factor
+  mutate(y = as.factor(y)) %>%
+  # Extract fitur Tahun dari kondisi makroekonomi
+  mutate(year = case_when(
+    emp.var.rate > 0 ~ 2008,
+    emp.var.rate <= 0 & emp.var.rate > -2 ~ 2009,
+    emp.var.rate <= -2 ~ 2010
+  )) %>%
+  mutate(year = as.factor(year)) %>%
+  # Ubah kolom karakter menjadi factor kembali
+  mutate(across(where(is.character), as.factor)) %>%
+  # Cegah Data Leakage
+  select(-duration)
+```
+
+
+# Plot Distribusi atau Boxplot Setelah Penanganan Outlier
+```{r}
+# Identify
+numeric_vars <- c("age", "campaign", "emp.var.rate", "cons.price.idx")
+
+# Reshape
+p_box <- df_clean %>%
+  select(all_of(numeric_vars)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = Variable, y = Value, fill = Variable)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.shape = 1) +
+  # INI KUNCINYA:
+  facet_wrap(~Variable, scales = "free") + 
+  theme_minimal() +
+  labs(title = "Boxplot Variabel Numerik (Skala Terpisah)",
+       subtitle = "Visualisasi sebaran data per variabel",
+       x = NULL, y = "Nilai") +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold")) # Mempertebal nama variabel
+
+# Density Plot untuk melihat normalitas/distribusi
+p_density <- df_clean %>%
+  select(all_of(numeric_vars)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = Value, fill = Variable)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribusi Kepadatan (Density Plot)",
+       subtitle = "Melihat bentuk distribusi setelah preprocessing",
+       x = "Nilai", y = "Density") +
+  theme(legend.position = "none")
+
+# Tampilkan Plot
+print(p_box)
+print(p_density)
+```
+
+# Dummy Encoding & Reduksi Dimensi
+```{r}
+# Dummy Encoding
+dummies <- dummyVars(~ ., data = df_clean %>% select(-y))
+df_transformed <- as.data.frame(predict(dummies, newdata = df_clean))
+df_transformed$y <- df_clean$y
+
+# Hapus Kolom Near-Zero Variance
+nzv_cols <- nearZeroVar(df_transformed)
+if(length(nzv_cols) > 0) {
+  df_transformed <- df_transformed[, -nzv_cols]
+  cat("\n[INFO] Menghapus", length(nzv_cols), "kolom NZV.\n")
+}
+
+# Hapus Multikolinearitas (Korelasi > 0.90)
+corr_matrix <- cor(df_transformed %>% select(where(is.numeric)))
+highlyCorDescr <- findCorrelation(corr_matrix, cutoff = 0.90)
+
+if(length(highlyCorDescr) > 0) {
+  df_transformed <- df_transformed[, -highlyCorDescr]
+  cat("\n[INFO] Menghapus", length(highlyCorDescr), "kolom karena multikolinearitas.\n")
+}
+```
+
+# Tabel Data Setelah Encoding
+```{r}
+library(kableExtra)
+# 10 baris pertama
+df_sample <- head(df_transformed, 10)
+
+# tabel
+knitr::kable(
+  df_sample, 
+  caption = "Cuplikan Data Setelah Dummy Encoding dan Reduksi Dimensi (10 Baris Pertama)",
+  align = "c"
+) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# Splitting Data
+```{r}
+# Split Data (80% Train, 20% Validasi)
+set.seed(16)
+train_index <- createDataPartition(df_transformed$y, p = 0.8, list = FALSE)
+train_set <- df_transformed[train_index, ]
+valid_set <- df_transformed[-train_index, ]
+```
+
+# Bar Chart Perbandingan Kelas
+```{r}
+# Buat dataset simulasi hasil downsampling untuk plot
+set.seed(16)
+x_plot <- train_set[, names(train_set) != "y"]
+y_plot <- train_set$y
+train_downsampled_obj <- downSample(x = x_plot, y = y_plot)
+
+# Hitung distribusinya
+train_dist <- as.data.frame(table(train_downsampled_obj$Class)) %>% 
+  mutate(Dataset = "Train (Simulasi Downsampled)")
+
+valid_dist <- as.data.frame(table(valid_set$y)) %>% 
+  mutate(Dataset = "Validation (Original/Imbalanced)")
+
+# Gabungkan dan Plot ulang
+plot_data <- rbind(train_dist, valid_dist)
+colnames(plot_data) <- c("Class", "Frequency", "Dataset")
+
+ggplot(plot_data, aes(x = Class, y = Frequency, fill = Class)) +
+  geom_bar(stat = "identity", color = "black", alpha = 0.8) +
+  facet_wrap(~Dataset, scales = "free_y") +
+  geom_text(aes(label = Frequency), vjust = -0.2, fontface = "bold") +
+  scale_fill_manual(values = c("no" = "tomato", "yes" = "springgreen4")) +
+  theme_minimal() +
+  labs(title = "Perbandingan Distribusi Kelas Target",
+       subtitle = "Menampilkan bagaimana model 'melihat' data saat training",
+       x = "Keputusan Deposito (y)", y = "Jumlah Observasi")
+```
+
+# Setup Train Control dengan Downsampling
+```{r}
+train_control <- trainControl(
+  method = 'cv',
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down",
+  allowParallel = TRUE
+)
+```
+
+# Multi-model Training
+```{r}
+models_list <- list()
+x_train <- train_set[, names(train_set) != "y"]
+y_train <- train_set$y
+base_preprocess <- c("center", "scale")
+
+# 1. RPART (Decision Tree)
+cat("Decision Tree (rpart)")
+t_rpart <- system.time({
+  set.seed(16)
+  models_list$rpart <- train(x = x_train, y = y_train, method = 'rpart', metric = 'ROC', trControl = train_control, preProcess = base_preprocess, tuneLength = 10)
+})
+cat("Selesai dalam", round(t_rpart["elapsed"], 2), "detik\n")
+
+
+# 2. RANGER (Random Forest)
+cat("Random Forest (ranger)")
+t_rf <- system.time({
+  set.seed(16)
+  models_list$rf <- train(x = x_train, y = y_train, method = 'ranger', metric = 'ROC', trControl = train_control, preProcess = base_preprocess, tuneLength = 3, num.threads = 1, importance = 'impurity') 
+})
+cat("Selesai dalam", round(t_rf["elapsed"], 2), "detik\n")
+
+
+# 3. SVM RADIAL
+cat("SVM (svmRadial)")
+t_svm <- system.time({
+  set.seed(16)
+  models_list$svmRadial <- train(x = x_train, y = y_train, method = 'svmRadial', metric = 'ROC', trControl = train_control, preProcess = base_preprocess, tuneLength = 2, prob.model = TRUE)
+})
+cat("Selesai dalam", round(t_svm["elapsed"], 2), "detik\n")
+
+
+# 4. NEURAL NETWORK (nnet)
+cat("Neural Network (nnet)")
+t_nnet <- system.time({
+  set.seed(16)
+  models_list$nnet <- train(x = x_train, y = y_train, method = 'nnet', metric = 'ROC', trControl = train_control, preProcess = base_preprocess, trace = FALSE, MaxNWts = 10000)
+})
+cat("Selesai dalam", round(t_nnet["elapsed"], 2), "detik\n")
+
+
+# 5. BAGGED CART (treebag)
+cat("Bagged CART (treebag)")
+t_treebag <- system.time({
+  set.seed(16)
+  models_list$treebag <- train(x = x_train, y = y_train, method = 'treebag', metric = 'ROC', trControl = train_control, preProcess = base_preprocess)
+})
+cat("Selesai dalam", round(t_treebag["elapsed"], 2), "detik\n")
+
+
+# 6. GRADIENT BOOSTING (gbm)
+cat("Gradient Boosting (gbm)")
+t_gbm <- system.time({
+  set.seed(16)
+  models_list$gbm <- train(x = x_train, y = y_train, method = 'gbm', metric = 'ROC', trControl = train_control, preProcess = base_preprocess, verbose = FALSE)
+})
+cat("Selesai dalam", round(t_gbm["elapsed"], 2), "detik\n")
+
+
+# Matikan cluster dan kembali ke sequential processing
+stopCluster(cl)
+registerDoSEQ()
+
+# Hitung Total Waktu Keseluruhan
+total_waktu <- t_rpart["elapsed"] + t_rf["elapsed"] + t_svm["elapsed"] + t_nnet["elapsed"] + t_treebag["elapsed"] + t_gbm["elapsed"]
+cat("\n=== Training Keseluruhan Selesai dalam", round(total_waktu / 60, 2), "menit ===\n")
+```
+
+# Optimalisasi Threshold
+```{r}
+thresholds <- seq(0.15, 0.95, by = 0.01)
+best_th_list <- list()
+actual_yes <- valid_set$y == 'yes'
+
+for(mn in names(models_list)) {
+  probs_valid <- tryCatch({
+    predict(models_list[[mn]], newdata = valid_set, type = 'prob')[, 'yes']
+  }, error = function(e) { return(rep(0, length(actual_yes))) })
+
+  if(any(is.na(probs_valid))) probs_valid[is.na(probs_valid)] <- 0
+
+  f1_max <- 0
+  best_th <- 0.5
+
+  for(th in thresholds) {
+    pred_yes <- probs_valid >= th
+    tp <- sum(pred_yes & actual_yes, na.rm = TRUE)
+    fp <- sum(pred_yes & !actual_yes, na.rm = TRUE)
+    fn <- sum(!pred_yes & actual_yes, na.rm = TRUE)
+
+    prec <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+    rec <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+    f1_val <- ifelse((prec + rec) == 0, 0, 2 * (prec * rec) / (prec + rec))
+
+    if(is.na(f1_val)) f1_val <- 0
+    if(f1_val > f1_max) { f1_max <- f1_val; best_th <- th }
+  }
+  best_th_list[[mn]] <- data.frame(Model = mn, Best_Threshold = best_th, F1 = f1_max)
+}
+
+results_opt <- dplyr::bind_rows(best_th_list) %>% arrange(desc(F1))
+```
+
+# Evaluasi & Winning Model
+```{r}
+eval_results_custom <- list()
+actual_y <- valid_set$y
+
+for(i in 1:nrow(results_opt)) {
+  mn <- results_opt$Model[i]
+  opt_th <- results_opt$Best_Threshold[i]
+
+  probs_valid <- tryCatch({
+    p <- predict(models_list[[mn]], newdata = valid_set, type = 'prob')
+    if(!is.null(dim(p)) && "yes" %in% colnames(p)) { p[, 'yes'] } else { rep(0, length(actual_y)) }
+  }, error = function(e) { rep(0, length(actual_y)) })
+
+  if(length(probs_valid) != length(actual_y)) probs_valid <- rep(0, length(actual_y))
+  probs_valid[is.na(probs_valid)] <- 0
+
+  pred_custom <- ifelse(probs_valid >= opt_th, "yes", "no")
+  pred_custom_factor <- factor(pred_custom, levels = c("no", "yes"))
+  actual_factor <- factor(actual_y, levels = c("no", "yes"))
+
+  # mode = "everything" untuk memunculkan Precision dan Specificity
+  cm <- confusionMatrix(pred_custom_factor, actual_factor, positive = "yes", mode = "everything")
+
+  # Memasukkan semua metrik ke dalam dataframe
+  eval_results_custom[[mn]] <- data.frame(
+    Model = mn,
+    Optimal_Threshold = opt_th,
+    Accuracy = cm$overall["Accuracy"],
+    Precision = cm$byClass["Precision"],
+    Sensitivity_Recall = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    F1_Score = cm$byClass["F1"]
+  )
+}
+
+# Menggabungkan hasil dan mengurutkan berdasarkan F1-Score tertinggi
+eval_df_custom <- dplyr::bind_rows(eval_results_custom) %>% arrange(desc(F1_Score))
+
+# Merapikan tampilan dengan menghapus rownames bawaan
+rownames(eval_df_custom) <- NULL
+
+# tabel lengkap
+print(eval_df_custom)
+
+# juara sejati
+true_best_model <- eval_df_custom$Model[1]
+true_best_th <- eval_df_custom$Optimal_Threshold[1]
+cat('\nJUARA SEJATI:', true_best_model, '| F1-Score:', round(eval_df_custom$F1_Score[1], 4), '| Threshold:', true_best_th, '\n')
+```
+
+# Visualisasi Evaluasi Model
+
+## Visualisasi Perbandingan Performa Model
+```{r}
+plot_eval <- eval_df_custom %>%
+  drop_na(F1_Score) %>%
+  dplyr::select(Model, Accuracy, F1_Score) %>%
+  tidyr::pivot_longer(cols = c(Accuracy, F1_Score), 
+                      names_to = "Metric", 
+                      values_to = "Value")
+
+# Plotting
+p_compare <- ggplot(plot_eval, aes(x = reorder(Model, Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.9, color = "white") +
+  coord_flip(ylim = c(0, 1.1)) + 
+  scale_fill_manual(values = c("Accuracy" = "grey70", "F1_Score" = "dodgerblue4")) +
+  geom_text(aes(label = round(Value, 3)), 
+            position = position_dodge(width = 0.9), 
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  theme_minimal() +
+  labs(title = "Perbandingan Akurasi vs F1-Score antar Model",
+       subtitle = "Model diurutkan berdasarkan performa terbaik (F1-Score)",
+       x = "Model Algoritma", y = "Score (0 - 1)") +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(face = "bold", size = 11))
+
+print(p_compare)
+```
+
+## Optimalisasi Treshold
+```{r}
+# Mengambil probabilitas prediksi dari model juara pada data validasi
+final_model <- models_list[[true_best_model]]
+probs_valid <- predict(final_model, newdata = valid_set, type = 'prob')[, 'yes']
+actual_yes <- valid_set$y == 'yes'
+
+# Kalkulasi ulang metrik untuk plotting
+metrics_list <- list()
+for(th in seq(0.30, 0.85, by = 0.02)) {
+  pred_yes <- probs_valid >= th
+  tp <- sum(pred_yes & actual_yes, na.rm = TRUE)
+  fp <- sum(pred_yes & !actual_yes, na.rm = TRUE)
+  fn <- sum(!pred_yes & actual_yes, na.rm = TRUE)
+  prec <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+  rec <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+  f1_val <- ifelse((prec + rec) == 0, 0, 2 * (prec * rec) / (prec + rec))
+  metrics_list[[length(metrics_list) + 1]] <- data.frame(
+    Threshold = th, Precision = prec, Sensitivity = rec, F1_Score = f1_val
+  )
+}
+metrics_df <- dplyr::bind_rows(metrics_list)
+
+# Reshape data untuk ggplot
+metrics_long <- metrics_df %>%
+  pivot_longer(cols = c(Precision, Sensitivity, F1_Score), names_to = "Metric", values_to = "Value")
+
+# Buat Plot
+p_opt <- ggplot(metrics_long, aes(x = Threshold, y = Value, color = Metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = true_best_th, linetype = "dashed", color = "black", size = 1) +
+  annotate("text", x = true_best_th + 0.01, y = 0.8, label = paste("Optimal:", true_best_th), hjust = 0, fontface = "bold") +
+  theme_minimal() +
+  labs(title = paste("Threshold Optimization Plot (", true_best_model, ")", sep=""),
+       subtitle = "Pergerakan F1-Score, Sensitivity, dan Precision",
+       x = "Probability Threshold", y = "Score") +
+  scale_color_brewer(palette = "Set1")
+
+print(p_opt)
+```
+
+## ROC/AUC
+```{r}
+library(pROC)
+
+# Ambil probabilitas dari model juara (Random Forest)
+final_model <- models_list[[true_best_model]]
+probs_valid <- predict(final_model, newdata = valid_set, type = 'prob')[, 'yes']
+
+# Buat objek ROC
+roc_obj <- roc(valid_set$y, probs_valid, levels = c("no", "yes"))
+auc_val <- auc(roc_obj)
+
+# Plot Kurva ROC
+plot(roc_obj, main = paste("ROC Curve -", true_best_model), 
+     col = "#1f77b4", lwd = 3, 
+     print.auc = TRUE, 
+     auc.polygon = TRUE, 
+     grid = TRUE,
+     auc.polygon.col = "#d3d3d355")
+```
+
+## Heatmap Confusion Matrix
+```{r}
+# Terapkan threshold pemenang
+pred_custom <- ifelse(probs_valid >= true_best_th, "yes", "no")
+pred_custom_factor <- factor(pred_custom, levels = c("no", "yes"))
+actual_factor <- factor(valid_set$y, levels = c("no", "yes"))
+
+cm <- confusionMatrix(pred_custom_factor, actual_factor, positive = "yes")
+cm_table <- as.data.frame(cm$table)
+
+p_cm <- ggplot(data = cm_table, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "dodgerblue4") +
+  geom_text(aes(label = Freq), vjust = 0.5, fontface = "bold", 
+            color = ifelse(cm_table$Freq > (max(cm_table$Freq)*0.4), "white", "black"), size = 6) +
+  theme_minimal() +
+  labs(title = paste("Confusion Matrix Heatmap (Threshold ", true_best_th, ")", sep=""),
+       subtitle = "Evaluasi pada Validation Set",
+       x = "Actual Class (Reference)",
+       y = "Predicted Class") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14, face = "bold"))
+
+print(p_cm)
+```
+
+## Variable Importance Plot
+```{r}
+library(gbm)
+
+# Hitung Tingkat Kepentingan Fitur dari model juara
+var_imp_model <- varImp(final_model, scale = TRUE)
+
+imp_df <- as.data.frame(var_imp_model$importance)
+imp_df$Feature <- rownames(imp_df)
+
+# Ekstrak nama kolom metrik
+metric_col <- names(imp_df)[1]
+
+# Ambil Top 15 Fitur 
+imp_top15 <- imp_df %>%
+  arrange(desc(!!sym(metric_col))) %>%
+  head(15)
+
+p_varimp <- ggplot(imp_top15, aes(x = reorder(Feature, !!sym(metric_col)), y = !!sym(metric_col))) +
+  geom_col(fill = "steelblue", color = "black", alpha = 0.8) +
+  coord_flip() + 
+  theme_minimal() +
+  labs(title = paste("Top 15 Variable Importance (", true_best_model, ")", sep=""),
+       subtitle = "Fitur paling berpengaruh terhadap prediksi target",
+       x = "Fitur (Variabel)",
+       y = "Tingkat Kepentingan (Importance Score)") +
+  theme(axis.text.y = element_text(size = 10, face = "bold"))
+
+print(p_varimp)
+```
+
+# Alignment dengan Dataset B & Final predict
+```{r}
+df_B <- read.csv("dataset_B.csv", stringsAsFactors = TRUE)
+
+df_B_clean <- df_B %>%
+  # Ubah unknown menjadi NA
+  mutate(across(where(is.factor), ~na_if(as.character(.), "unknown"))) %>%
+  # Lakukan transformasi lainnya yang sama persis di Dataset A
+  mutate(education = ifelse(grepl("basic", as.character(education)), "basic", as.character(education))) %>%
+  mutate(
+    previous_contact = ifelse(pdays != 999, 1, 0),
+    previous_contact = as.factor(previous_contact)
+  ) %>%
+  select(-pdays) %>%
+  mutate(year = case_when(
+    emp.var.rate > 0 ~ 2008,
+    emp.var.rate <= 0 & emp.var.rate > -2 ~ 2009,
+    emp.var.rate <= -2 ~ 2010
+  )) %>%
+  mutate(year = as.factor(year)) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  select(-duration)
+
+# Alignment Factor Levels antara A dan B (hanya untuk kolom yang ada di kedua dataset)
+for(col in names(df_clean)) {
+  if(is.factor(df_clean[[col]]) && col %in% names(df_B_clean)) {
+    # Paksa level kategori di B agar sama persis dengan A
+    df_B_clean[[col]] <- factor(df_B_clean[[col]], levels = levels(df_clean[[col]]))
+  }
+}
+
+# Transformasi Dummy
+df_B_transformed <- as.data.frame(predict(dummies, newdata = df_B_clean, na.action = na.pass))
+
+# Ganti nilai NA hasil dari 'unknown' di matriks dummy menjadi 0
+df_B_transformed[is.na(df_B_transformed)] <- 0
+
+# Hapus kolom NZV jika ada
+if(exists("nzv_cols") && length(nzv_cols) > 0) {
+  df_B_transformed <- df_B_transformed[, -nzv_cols, drop = FALSE]
+}
+
+# apus kolom yang memiliki multikolinearitas
+if(exists("highlyCorDescr") && length(highlyCorDescr) > 0) {
+  df_B_transformed <- df_B_transformed[, -highlyCorDescr, drop = FALSE]
+}
+
+# PREDIKSI
+final_model <- models_list[[true_best_model]]
+pred_prob_B <- predict(final_model, newdata = df_B_transformed, type = "prob")[, "yes"]
+pred_class_B_custom <- ifelse(pred_prob_B >= true_best_th, "yes", "no")
+
+# Membuat dataframe baru hanya dengan kolom 'id' dan 'y_pred'
+df_submission <- data.frame(
+  id = 1:nrow(df_B),
+  y_pred = pred_class_B_custom
+)
+
+# Simpan Hasil Sesuai Format
+write.csv(df_submission, "Hasil_Prediksi_Format_Submission.csv", row.names = FALSE)
+cat("\nFile 'Hasil_Prediksi_Format_Submission.csv' berhasil dibuat sesuai format tugas.\n")
+```
+
+
